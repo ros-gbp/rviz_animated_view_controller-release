@@ -36,6 +36,8 @@
 #include "rviz/viewport_mouse_event.h"
 #include "rviz/frame_manager.h"
 #include "rviz/geometry.h"
+#include "rviz/view_manager.h"
+#include "rviz/render_panel.h"
 #include "rviz/ogre_helpers/shape.h"
 #include "rviz/properties/float_property.h"
 #include "rviz/properties/vector_property.h"
@@ -52,6 +54,7 @@
 #include <OGRE/OgreSceneNode.h>
 #include <OGRE/OgreSceneManager.h>
 #include <OGRE/OgreCamera.h>
+#include <OGRE/OgreRenderWindow.h>
 
 namespace rviz_animated_view_controller
 {
@@ -92,7 +95,14 @@ static inline void vectorOgreToMsg(const Ogre::Vector3 &o, geometry_msgs::Vector
 
 
 AnimatedViewController::AnimatedViewController()
-  : nh_(""), animate_(false), dragging_( false )
+  : nh_("")
+    , cam_movements_buffer_(100)
+    , animate_(false)
+    , dragging_(false)
+    , render_frame_by_frame_(false)
+    , target_fps_(60)
+    , rendered_frames_counter_(0)
+    , pause_animation_duration_(0.0)
 {
   interaction_disabled_cursor_ = makeIconCursor( "package://rviz/icons/forbidden.svg" );
 
@@ -130,9 +140,20 @@ AnimatedViewController::AnimatedViewController()
                                                           QString::fromStdString(ros::message_traits::datatype<view_controller_msgs::CameraPlacement>() ),
                                                           "Topic for CameraPlacement messages", this, SLOT(updateTopics()));
 
-//  camera_placement_trajectory_topic_property_ = new RosTopicProperty("Trajectory Topic", "/rviz/camera_placement_trajectory",
-//                                                          QString::fromStdString(ros::message_traits::datatype<view_controller_msgs::CameraPlacementTrajectory>() ),
-//                                                          "Topic for CameraPlacementTrajectory messages", this, SLOT(updateTopics()));
+  camera_trajectory_topic_property_ = new RosTopicProperty("Trajectory Topic", "/rviz/camera_trajectory",
+                                                           QString::fromStdString(
+                                                             ros::message_traits::datatype<view_controller_msgs::CameraTrajectory>()),
+                                                           "Topic for CameraTrajectory messages", this,
+                                                           SLOT(updateTopics()));
+
+  window_width_property_ = new FloatProperty("Window Width", 1000, "The width of the rviz visualization window in pixels.", this);
+  window_height_property_ = new FloatProperty("Window Height", 1000, "The height of the rviz visualization window in pixels.", this);
+  
+  publish_view_images_property_ = new BoolProperty("Publish View Images During Animation", false, 
+                                                   "If enabled, publishes images of what the user sees in the visualization window during an animation.", 
+                                                   this);
+  initializePublishers();
+  initializeSubscribers();
 }
 
 AnimatedViewController::~AnimatedViewController()
@@ -143,12 +164,34 @@ AnimatedViewController::~AnimatedViewController()
 
 void AnimatedViewController::updateTopics()
 {
-//  trajectory_subscriber_ = nh_.subscribe<view_controller_msgs::CameraPlacementTrajectory>
-//                              (camera_placement_trajectory_topic_property_->getStdString(), 1,
-//                              boost::bind(&AnimatedViewController::cameraPlacementTrajectoryCallback, this, _1));
   placement_subscriber_  = nh_.subscribe<view_controller_msgs::CameraPlacement>
                               (camera_placement_topic_property_->getStdString(), 1,
                               boost::bind(&AnimatedViewController::cameraPlacementCallback, this, _1));
+  
+  trajectory_subscriber_ = nh_.subscribe<view_controller_msgs::CameraTrajectory>
+                                (camera_trajectory_topic_property_->getStdString(), 1,
+                                 boost::bind(&AnimatedViewController::cameraTrajectoryCallback, this, _1));
+}
+
+void AnimatedViewController::initializePublishers()
+{
+  current_camera_pose_publisher_ = nh_.advertise<geometry_msgs::Pose>("/rviz/current_camera_pose", 1);
+  finished_animation_publisher_ = nh_.advertise<std_msgs::Bool>("/rviz/finished_animation", 1);
+
+  image_transport::ImageTransport it(nh_);
+  camera_view_image_publisher_ = it.advertise("/rviz/view_image", 1);
+}
+
+void AnimatedViewController::initializeSubscribers()
+{
+  pause_animation_duration_subscriber_ = nh_.subscribe("/rviz/pause_animation_duration", 1,
+                                                       &AnimatedViewController::pauseAnimationCallback, this);
+}
+
+void AnimatedViewController::pauseAnimationCallback(const std_msgs::Duration::ConstPtr& pause_duration_msg)
+{
+  pause_animation_duration_.sec = pause_duration_msg->data.sec;
+  pause_animation_duration_.nsec = pause_duration_msg->data.nsec;
 }
 
 void AnimatedViewController::onInitialize()
@@ -165,6 +208,13 @@ void AnimatedViewController::onInitialize()
     focal_shape_->setColor(1.0f, 1.0f, 0.0f, 0.5f);
     focal_shape_->getRootNode()->setVisible(false);
 
+    updateWindowSizeProperties();
+}
+
+void AnimatedViewController::updateWindowSizeProperties()
+{
+  window_width_property_->setFloat(context_->getViewManager()->getRenderPanel()->getRenderWindow()->getWidth());
+  window_height_property_->setFloat(context_->getViewManager()->getRenderPanel()->getRenderWindow()->getHeight());
 }
 
 void AnimatedViewController::onActivate()
@@ -427,8 +477,22 @@ void AnimatedViewController::handleMouseEvent(ViewportMouseEvent& event)
 
   if (moved)
   {
+    publishCameraPose();
     context_->queueRender();
   }
+}
+
+void AnimatedViewController::publishCameraPose()
+{
+  geometry_msgs::Pose cam_pose;
+  cam_pose.position.x = camera_->getPosition().x;
+  cam_pose.position.y = camera_->getPosition().y;
+  cam_pose.position.z = camera_->getPosition().z;
+  cam_pose.orientation.w = camera_->getOrientation().w;
+  cam_pose.orientation.x = camera_->getOrientation().x;
+  cam_pose.orientation.y = camera_->getOrientation().y;
+  cam_pose.orientation.z = camera_->getOrientation().z;
+  current_camera_pose_publisher_.publish(cam_pose);
 }
 
 //void AnimatedViewController::setUpVectorPropertyModeDependent( const Ogre::Vector3 &vector )
@@ -503,31 +567,35 @@ void AnimatedViewController::transitionFrom( ViewController* previous_view )
   }
 }
 
-void AnimatedViewController::beginNewTransition(const Ogre::Vector3 &eye, const Ogre::Vector3 &focus, const Ogre::Vector3 &up,
-                                            const ros::Duration &transition_time)
+void AnimatedViewController::beginNewTransition(const Ogre::Vector3 &eye, 
+                                                const Ogre::Vector3 &focus, 
+                                                const Ogre::Vector3 &up,
+                                                ros::Duration transition_duration,
+                                                uint8_t interpolation_speed)
 {
-  if(ros::Duration(transition_time).isZero())
-  {
-    eye_point_property_->setVector(eye);
-    focus_point_property_->setVector(focus);
-    up_vector_property_->setVector(up);
-    distance_property_->setFloat(getDistanceFromCameraToFocalPoint());
+  if(transition_duration.toSec() < 0.0)
     return;
+
+  // convert positional jumps to very fast movements to prevent numerical problems 
+  if(transition_duration.isZero())
+    transition_duration = ros::Duration(0.001);
+
+  // if the buffer is empty we set the first element in it to the current camera pose
+  if(cam_movements_buffer_.empty())
+  {
+    transition_start_time_ = ros::WallTime::now();
+
+    cam_movements_buffer_.push_back(std::move(OgreCameraMovement(eye_point_property_->getVector(),
+                                                                 focus_point_property_->getVector(),
+                                                                 up_vector_property_->getVector(),
+                                                                 ros::Duration(0.001),
+                                                                 interpolation_speed))); // interpolation_speed doesn't make a difference for very short times
   }
 
-  start_position_ = eye_point_property_->getVector();
-  goal_position_ = eye;
+  if(cam_movements_buffer_.full())
+    cam_movements_buffer_.set_capacity(cam_movements_buffer_.capacity() + 20);
 
-  start_focus_ = focus_point_property_->getVector();
-  goal_focus_ = focus;
-
-//  start_up_ = fixed_up_property_->getBool() ? (Ogre::Vector3::UNIT_Z) : getOrientation().yAxis();
-//  goal_up_ =  fixed_up_property_->getBool() ? (Ogre::Vector3::UNIT_Z) : up;
-  start_up_ = up_vector_property_->getVector();
-  goal_up_ =  up;
-
-  current_transition_duration_ = ros::Duration(transition_time);
-  transition_start_time_ = ros::Time::now();
+  cam_movements_buffer_.push_back(std::move(OgreCameraMovement(eye, focus, up, transition_duration, interpolation_speed)));
 
   animate_ = true;
 }
@@ -535,6 +603,17 @@ void AnimatedViewController::beginNewTransition(const Ogre::Vector3 &eye, const 
 void AnimatedViewController::cancelTransition()
 {
   animate_ = false;
+
+  cam_movements_buffer_.clear();
+  rendered_frames_counter_ = 0;
+
+  if(render_frame_by_frame_)
+  {
+    std_msgs::Bool finished_animation;
+    finished_animation.data = 1;  // set to true, but std_msgs::Bool is uint8 internally
+    finished_animation_publisher_.publish(finished_animation);
+    render_frame_by_frame_ = false;
+  }
 }
 
 void AnimatedViewController::cameraPlacementCallback(const CameraPlacementConstPtr &cp_ptr)
@@ -561,7 +640,9 @@ void AnimatedViewController::cameraPlacementCallback(const CameraPlacementConstP
   if(cp.time_from_start.toSec() >= 0)
   {
     ROS_DEBUG_STREAM("Received a camera placement request! \n" << cp);
-    transformCameraPlacementToAttachedFrame(cp);
+    transformCameraToAttachedFrame(cp.eye,
+                                   cp.focus,
+                                   cp.up);
     ROS_DEBUG_STREAM("After transform, we have \n" << cp);
 
     Ogre::Vector3 eye = vectorFromMsg(cp.eye.point);
@@ -572,69 +653,85 @@ void AnimatedViewController::cameraPlacementCallback(const CameraPlacementConstP
   }
 }
 
-//void AnimatedViewController::cameraPlacementTrajectoryCallback(const CameraPlacementTrajectoryConstPtr &cptptr)
-//{
-//  CameraPlacementTrajectory cpt = *cptptr;
-//  ROS_DEBUG_STREAM("Received a camera placement trajectory request! \n" << cpt);
-  
-//  // Handle control parameters
-//  mouse_enabled_property_->setBool( cpt.interaction_enabled );
-//  fixed_up_property_->setBool( !cpt.allow_free_yaw_axis );
-//  if(cpt.mouse_interaction_mode != cpt.NO_CHANGE)
-//  {
-//    std::string name = "";
-//    if(cpt.mouse_interaction_mode == cpt.ORBIT) name = MODE_ORBIT;
-//    else if(cpt.mouse_interaction_mode == cpt.FPS) name = MODE_FPS;
-//    interaction_mode_property_->setStdString(name);
-//  }
-
-//  // TODO should transform the interpolated positions (later), or transform info will only reflect the TF tree state at the beginning...
-//  for(size_t i = 0; i<cpt.placements.size(); i++)
-//  {
-//    transformCameraPlacementToAttachedFrame(cpt.placements[i]);
-//  }
-
-//  // For now, just transition to the first placement until we put in the capacity for a trajectory
-//  CameraPlacement cp = cpt.placements[0];
-//  if(cp.target_frame != "")
-//  {
-//    attached_frame_property_->setStdString(cp.target_frame);
-//    updateAttachedFrame();
-//  }
-//  Ogre::Vector3 eye = vectorFromMsg(cp.eye.point);
-//  Ogre::Vector3 focus = vectorFromMsg(cp.focus.point);
-//  Ogre::Vector3 up = vectorFromMsg(cp.up.vector);
-
-//  beginNewTransition(eye, focus, up, cp.time_from_start);
-//}
-
-void AnimatedViewController::transformCameraPlacementToAttachedFrame(CameraPlacement &cp)
+void AnimatedViewController::cameraTrajectoryCallback(const view_controller_msgs::CameraTrajectoryConstPtr& ct_ptr)
 {
-  Ogre::Vector3 position_fixed_eye, position_fixed_focus, position_fixed_up; // position_fixed_attached;
-  Ogre::Quaternion rotation_fixed_eye, rotation_fixed_focus, rotation_fixed_up; // rotation_fixed_attached;
+  view_controller_msgs::CameraTrajectory ct = *ct_ptr;
 
-  context_->getFrameManager()->getTransform(cp.eye.header.frame_id, ros::Time(0), position_fixed_eye, rotation_fixed_eye);
-  context_->getFrameManager()->getTransform(cp.focus.header.frame_id,  ros::Time(0), position_fixed_focus, rotation_fixed_focus);
-  context_->getFrameManager()->getTransform(cp.up.header.frame_id,  ros::Time(0), position_fixed_up, rotation_fixed_up);
-  //context_->getFrameManager()->getTransform(attached_frame_property_->getStdString(),  ros::Time(0), position_fixed_attached, rotation_fixed_attached);
+  if(ct.trajectory.empty())
+    return;
 
-  Ogre::Vector3 eye = vectorFromMsg(cp.eye.point); 
-  Ogre::Vector3 focus = vectorFromMsg(cp.focus.point); 
-  Ogre::Vector3 up = vectorFromMsg(cp.up.vector); 
+  // Handle control parameters
+  mouse_enabled_property_->setBool(!ct.interaction_disabled);
+  fixed_up_property_->setBool(!ct.allow_free_yaw_axis);
+  if(ct.mouse_interaction_mode != view_controller_msgs::CameraTrajectory::NO_CHANGE)
+  {
+    std::string name = "";
+    if(ct.mouse_interaction_mode == view_controller_msgs::CameraTrajectory::ORBIT)
+      name = MODE_ORBIT;
+    else if(ct.mouse_interaction_mode == view_controller_msgs::CameraTrajectory::FPS)
+      name = MODE_FPS;
+    interaction_mode_property_->setStdString(name);
+  }
 
-  eye = fixedFrameToAttachedLocal(position_fixed_eye + rotation_fixed_eye*eye);
-  focus = fixedFrameToAttachedLocal(position_fixed_focus + rotation_fixed_focus*focus);
-  up = reference_orientation_.Inverse()*rotation_fixed_up*up;
-  //up = rotation_fixed_up*up;
+  if(ct.render_frame_by_frame > 0)
+  {
+    render_frame_by_frame_ = true;
+    target_fps_ = static_cast<int>(ct.frames_per_second);
+    publish_view_images_property_->setBool(true);
+  }
 
-  cp.eye.point = pointOgreToMsg(eye);
-  cp.focus.point = pointOgreToMsg(focus);
-  cp.up.vector = vectorOgreToMsg(up);
-  cp.eye.header.frame_id = attached_frame_property_->getStdString();
-  cp.focus.header.frame_id = attached_frame_property_->getStdString();
-  cp.up.header.frame_id = attached_frame_property_->getStdString();
+  for(auto& cam_movement : ct.trajectory)
+  {
+    if(cam_movement.transition_duration.toSec() >= 0.0)
+    {
+      if(ct.target_frame != "")
+      {
+        attached_frame_property_->setStdString(ct.target_frame);
+        updateAttachedFrame();
+      }
+
+      transformCameraToAttachedFrame(cam_movement.eye,
+                                     cam_movement.focus,
+                                     cam_movement.up);
+
+      Ogre::Vector3 eye = vectorFromMsg(cam_movement.eye.point);
+      Ogre::Vector3 focus = vectorFromMsg(cam_movement.focus.point);
+      Ogre::Vector3 up = vectorFromMsg(cam_movement.up.vector);
+      beginNewTransition(eye, focus, up, cam_movement.transition_duration, cam_movement.interpolation_speed);
+    }
+    else
+    {
+      ROS_WARN("Transition duration of camera movement is below zero. Skipping that movement.");
+    }
+  }
 }
 
+void AnimatedViewController::transformCameraToAttachedFrame(geometry_msgs::PointStamped& eye,
+                                                            geometry_msgs::PointStamped& focus,
+                                                            geometry_msgs::Vector3Stamped& up)
+{
+  Ogre::Vector3 position_fixed_eye, position_fixed_focus, position_fixed_up;
+  Ogre::Quaternion rotation_fixed_eye, rotation_fixed_focus, rotation_fixed_up;
+
+  context_->getFrameManager()->getTransform(eye.header.frame_id,   ros::Time(0), position_fixed_eye,   rotation_fixed_eye);
+  context_->getFrameManager()->getTransform(focus.header.frame_id, ros::Time(0), position_fixed_focus, rotation_fixed_focus);
+  context_->getFrameManager()->getTransform(up.header.frame_id,    ros::Time(0), position_fixed_up,    rotation_fixed_up);
+
+  Ogre::Vector3 ogre_eye = vectorFromMsg(eye.point);
+  Ogre::Vector3 ogre_focus = vectorFromMsg(focus.point);
+  Ogre::Vector3 ogre_up = vectorFromMsg(up.vector);
+
+  ogre_eye = fixedFrameToAttachedLocal(position_fixed_eye + rotation_fixed_eye * ogre_eye);
+  ogre_focus = fixedFrameToAttachedLocal(position_fixed_focus + rotation_fixed_focus * ogre_focus);
+  ogre_up = reference_orientation_.Inverse() * rotation_fixed_up * ogre_up;
+
+  eye.point = pointOgreToMsg(ogre_eye);
+  focus.point = pointOgreToMsg(ogre_focus);
+  up.vector = vectorOgreToMsg(ogre_up);
+  eye.header.frame_id = attached_frame_property_->getStdString();
+  focus.header.frame_id = attached_frame_property_->getStdString();
+  up.header.frame_id = attached_frame_property_->getStdString();
+}
 
 // We must assume that this point is in the Rviz Fixed frame since it came from Rviz...
 void AnimatedViewController::lookAt( const Ogre::Vector3& point )
@@ -671,23 +768,29 @@ void AnimatedViewController::update(float dt, float ros_dt)
 {
   updateAttachedSceneNode();
 
-  if(animate_)
+  if(animate_ && isMovementAvailable())
   {
-    ros::Duration time_from_start = ros::Time::now() - transition_start_time_;
-    float fraction = time_from_start.toSec()/current_transition_duration_.toSec();
+    pauseAnimationOnRequest();
+
+    auto start = cam_movements_buffer_.begin();
+    auto goal = ++(cam_movements_buffer_.begin());
+
+    double relative_progress_in_time = computeRelativeProgressInTime(goal->transition_duration);
+
     // make sure we get all the way there before turning off
-    if(fraction > 1.0f)
+    bool finished_current_movement = false;
+    if(relative_progress_in_time >= 1.0)
     {
-      fraction = 1.0f;
-      animate_ = false;
+      relative_progress_in_time = 1.0;
+      finished_current_movement = true;
     }
 
-    // TODO remap progress to progress_out, which can give us a new interpolation profile.
-    float progress = 0.5*(1-cos(fraction*M_PI));
+    float relative_progress_in_space = computeRelativeProgressInSpace(relative_progress_in_time,
+                                                                      goal->interpolation_speed);
 
-    Ogre::Vector3 new_position = start_position_ + progress*(goal_position_ - start_position_);
-    Ogre::Vector3 new_focus  = start_focus_ + progress*(goal_focus_ - start_focus_);
-    Ogre::Vector3 new_up  = start_up_ + progress*(goal_up_ - start_up_);
+    Ogre::Vector3 new_position = start->eye + relative_progress_in_space * (goal->eye - start->eye);
+    Ogre::Vector3 new_focus = start->focus + relative_progress_in_space * (goal->focus - start->focus);
+    Ogre::Vector3 new_up = start->up + relative_progress_in_space * (goal->up - start->up);
 
     disconnectPositionProperties();
     eye_point_property_->setVector( new_position );
@@ -699,8 +802,124 @@ void AnimatedViewController::update(float dt, float ros_dt)
     // This needs to happen so that the camera orientation will update properly when fixed_up_property == false
     camera_->setFixedYawAxis(true, reference_orientation_ * up_vector_property_->getVector());
     camera_->setDirection(reference_orientation_ * (focus_point_property_->getVector() - eye_point_property_->getVector()));
+
+    publishCameraPose();
+    
+    if(publish_view_images_property_->getBool())
+      publishViewImage();
+
+    if(finished_current_movement)
+    {
+      // delete current start element in buffer
+      cam_movements_buffer_.pop_front();
+
+      if(isMovementAvailable())
+        prepareNextMovement(goal->transition_duration);
+      else
+        cancelTransition();
+    }
   }
   updateCamera();
+  updateWindowSizeProperties();
+}
+
+void AnimatedViewController::pauseAnimationOnRequest()
+{
+  if(pause_animation_duration_.toSec() > 0.0)
+  {
+    pause_animation_duration_.sleep();
+    transition_start_time_ += pause_animation_duration_;
+    pause_animation_duration_.fromSec(0.0);
+  }
+}
+
+double AnimatedViewController::computeRelativeProgressInTime(const ros::Duration& transition_duration)
+{
+  double relative_progress_in_time = 0.0;
+  if(render_frame_by_frame_)
+  {
+    relative_progress_in_time = rendered_frames_counter_ / (target_fps_ * transition_duration.toSec());
+    rendered_frames_counter_++;
+  }
+  else
+  {
+    ros::WallDuration duration_from_start = ros::WallTime::now() - transition_start_time_;
+    relative_progress_in_time = duration_from_start.toSec() / transition_duration.toSec();
+  }
+  return relative_progress_in_time;
+}
+
+float AnimatedViewController::computeRelativeProgressInSpace(double relative_progress_in_time,
+                                                             uint8_t interpolation_speed)
+{
+  switch(interpolation_speed)
+  {
+    case view_controller_msgs::CameraMovement::RISING:
+      return 1.f - static_cast<float>(cos(relative_progress_in_time * M_PI_2));
+    case view_controller_msgs::CameraMovement::DECLINING:
+      return static_cast<float>(-cos(relative_progress_in_time * M_PI_2 + M_PI_2));
+    case view_controller_msgs::CameraMovement::FULL:
+      return static_cast<float>(relative_progress_in_time);
+    case view_controller_msgs::CameraMovement::WAVE:
+    default:
+      return 0.5f * (1.f - static_cast<float>(cos(relative_progress_in_time * M_PI)));
+  }
+}
+
+void AnimatedViewController::publishViewImage()
+{
+  if(camera_view_image_publisher_.getNumSubscribers() > 0)
+  {
+    std::shared_ptr<Ogre::PixelBox> pixel_box = std::make_shared<Ogre::PixelBox>();
+    getViewImage(pixel_box);
+
+    sensor_msgs::ImagePtr image_msg = sensor_msgs::ImagePtr(new sensor_msgs::Image());
+    convertImage(pixel_box, image_msg);
+
+    camera_view_image_publisher_.publish(image_msg);
+
+    delete[] (unsigned char*)pixel_box->data;
+  }
+}
+
+void AnimatedViewController::getViewImage(std::shared_ptr<Ogre::PixelBox>& pixel_box)
+{
+  const unsigned int image_height = context_->getViewManager()->getRenderPanel()->getRenderWindow()->getHeight();
+  const unsigned int image_width = context_->getViewManager()->getRenderPanel()->getRenderWindow()->getWidth();
+
+  // create a PixelBox to store the rendered view image
+  const Ogre::PixelFormat pixel_format = Ogre::PF_BYTE_BGR;
+  const auto bytes_per_pixel = Ogre::PixelUtil::getNumElemBytes(pixel_format);
+  auto image_data = new unsigned char[image_width * image_height * bytes_per_pixel];
+  Ogre::Box image_extents(0, 0, image_width, image_height);
+  pixel_box = std::make_shared<Ogre::PixelBox>(image_extents, pixel_format, image_data);
+  context_->getViewManager()->getRenderPanel()->getRenderWindow()->copyContentsToMemory(*pixel_box,
+                                                                                        Ogre::RenderTarget::FB_AUTO);
+}
+
+void AnimatedViewController::convertImage(std::shared_ptr<Ogre::PixelBox> input_image,
+                                          sensor_msgs::ImagePtr output_image)
+{
+  const auto bytes_per_pixel = Ogre::PixelUtil::getNumElemBytes(input_image->format);
+  const auto image_height = input_image->getHeight();
+  const auto image_width = input_image->getWidth();
+
+  output_image->header.frame_id = attached_frame_property_->getStdString();
+  output_image->header.stamp = ros::Time::now();
+  output_image->height = image_height;
+  output_image->width = image_width;
+  output_image->encoding = sensor_msgs::image_encodings::BGR8;
+  output_image->is_bigendian = false;
+  output_image->step = static_cast<unsigned int>(image_width * bytes_per_pixel);
+  size_t size = image_width * image_height * bytes_per_pixel;
+  output_image->data.resize(size);
+  memcpy((char*)(&output_image->data[0]), input_image->data, size);
+}
+
+void AnimatedViewController::prepareNextMovement(const ros::Duration& previous_transition_duration)
+{
+  transition_start_time_ += ros::WallDuration(previous_transition_duration.toSec());
+  rendered_frames_counter_ = 0;
 }
 
 void AnimatedViewController::updateCamera()

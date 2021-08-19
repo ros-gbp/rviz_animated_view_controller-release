@@ -1,35 +1,59 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.5)
 project(rviz_animated_view_controller)
 
 find_package(cmake_modules REQUIRED)
-find_package(Eigen REQUIRED)
+find_package(Eigen3 3.3 REQUIRED)
 find_package(Boost REQUIRED system filesystem)
 
+find_package(PkgConfig REQUIRED)
 # Ogre
 pkg_check_modules(OGRE OGRE)
-
-# Qt Stuff
-find_package(Qt4 REQUIRED)
-include(${QT_USE_FILE})
-add_definitions(-DQT_NO_KEYWORDS)
 
 find_package(OpenGL REQUIRED)
 
 find_package(catkin REQUIRED COMPONENTS
+ cv_bridge
+ image_transport
  rviz
  pluginlib
+ geometry_msgs
+ std_msgs
  view_controller_msgs
 )
+
+if(DEFINED rviz_QT_VERSION)
+if(rviz_QT_VERSION VERSION_LESS "5")
+  message(STATUS "Using Qt4 based on the rviz_QT_VERSION: ${rviz_QT_VERSION}")
+  find_package(Qt4 ${rviz_QT_VERSION} EXACT REQUIRED QtCore QtGui)
+  ## pull in all required include dirs, define QT_LIBRARIES, etc.
+  include(${QT_USE_FILE})
+
+  
+  qt4_wrap_cpp(MOC_FILES
+    include/${PROJECT_NAME}/rviz_animated_view_controller.h
+  )
+else()
+  message(STATUS "Using Qt5 based on the rviz_QT_VERSION: ${rviz_QT_VERSION}")
+  find_package(Qt5Widgets ${rviz_QT_VERSION} EXACT REQUIRED)
+  find_package(Qt5Core ${rviz_QT_VERSION} EXACT REQUIRED)
+  ## make target_link_libraries(${QT_LIBRARIES}) pull in all required dependencies
+  set(QT_LIBRARIES Qt5::Widgets)
+
+  qt5_wrap_cpp(MOC_FILES
+    include/${PROJECT_NAME}/rviz_animated_view_controller.h
+  )
+endif()
+else()
+  message(FATAL_ERROR "Could not detect Rviz Qt version")
+endif()
+
+add_definitions(-DQT_NO_KEYWORDS)
 
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES ${PROJECT_NAME}
-  CATKIN_DEPENDS view_controller_msgs
+  CATKIN_DEPENDS geometry_msgs std_msgs view_controller_msgs
   )
-
-qt4_wrap_cpp(MOC_FILES
-  include/${PROJECT_NAME}/rviz_animated_view_controller.h
-)
 
 include_directories(include
                     ${catkin_INCLUDE_DIRS}
