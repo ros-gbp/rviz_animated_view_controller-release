@@ -1,0 +1,12 @@
+Source: ros-melodic-rviz-animated-view-controller
+Section: misc
+Priority: optional
+Maintainer: Evan Flynn <evanflynn.msu@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), libeigen3-dev, libgl1-mesa-dev, libglu1-mesa-dev, qtbase5-dev, ros-melodic-catkin, ros-melodic-cmake-modules, ros-melodic-cv-bridge, ros-melodic-geometry-msgs, ros-melodic-image-transport, ros-melodic-pluginlib, ros-melodic-rviz, ros-melodic-std-msgs, ros-melodic-view-controller-msgs
+Homepage: http://ros.org/wiki/rviz_animated_view_controller
+Standards-Version: 3.9.2
+
+Package: ros-melodic-rviz-animated-view-controller
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libeigen3-dev, libgl1-mesa-dev, libglu1-mesa-dev, qtbase5-dev, ros-melodic-cmake-modules, ros-melodic-cv-bridge, ros-melodic-geometry-msgs, ros-melodic-image-transport, ros-melodic-pluginlib, ros-melodic-rviz, ros-melodic-std-msgs, ros-melodic-view-controller-msgs
+Description: A rviz view controller featuring smooth transitions.
